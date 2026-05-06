@@ -12,14 +12,49 @@ from urllib.parse import urlencode
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+DISCORD_TOKEN     = os.getenv("DISCORD_TOKEN")
+FAA_CLIENT_ID     = os.getenv("FAA_CLIENT_ID", "")
+FAA_CLIENT_SECRET = os.getenv("FAA_CLIENT_SECRET", "")
 
 VATSIM_DATA_URL   = "https://data.vatsim.net/v3/vatsim-data.json"
+VATSIM_EVENTS_URL = "https://my.vatsim.net/api/v1/events/all"
 AWC_METAR_URL     = "https://aviationweather.gov/api/data/metar"
 AWC_TAF_URL       = "https://aviationweather.gov/api/data/taf"
+AWC_PIREP_URL     = "https://aviationweather.gov/api/data/pirep"
+FAA_NOTAM_TOKEN_URL = "https://external-api.faa.gov/auth/oauth/token"
+FAA_NOTAM_URL       = "https://external-api.faa.gov/notamapi/v1/notams"
 OF_ROUTES_URL     = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat"
 OF_AIRPORTS_URL   = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
 OF_AIRLINES_URL   = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
+
+# Typical aircraft types per route distance band (NM)
+# Used to show realistic equipment on suggested routes
+ROUTE_AIRCRAFT_TYPES = {
+    "short":   (0,    500,  ["B738", "A320", "A319", "E190", "CRJ9", "DH8D", "A21N"]),
+    "medium":  (500,  2000, ["B738", "A320", "A321", "B739", "A21N", "B752", "A20N"]),
+    "long":    (2000, 4500, ["B788", "B789", "A333", "A332", "B772", "A339", "B77W"]),
+    "ultralong":(4500, 99999,["B77W", "A359", "A35K", "B789", "B788", "A388", "B748"]),
+}
+
+# Per-airline typical fleet (IATA -> [aircraft types])
+AIRLINE_FLEET = {
+    "AA": ["B738", "B772", "B77W", "A319", "A320", "A321", "B787"],
+    "UA": ["B738", "B739", "B772", "B77W", "B788", "B789", "A319", "A320"],
+    "DL": ["B738", "B739", "B752", "B764", "B772", "A319", "A320", "A321"],
+    "WN": ["B737", "B738"],
+    "BA": ["B772", "B77W", "B788", "B789", "A319", "A320", "A321", "A388"],
+    "LH": ["B744", "B748", "A319", "A320", "A321", "A333", "A343", "A346"],
+    "AF": ["B772", "A318", "A319", "A320", "A321", "A332", "A333", "A388"],
+    "KL": ["B772", "B773", "A330", "B738", "E190"],
+    "EK": ["B77W", "A388", "B773", "A359"],
+    "QR": ["B772", "B77W", "A320", "A321", "A333", "A359", "A35K", "A388"],
+    "SQ": ["B772", "B77W", "B788", "B789", "A359", "A35K", "A388"],
+    "QF": ["B738", "B744", "B788", "B789", "A330", "A380"],
+    "AC": ["B738", "B788", "B789", "A319", "A320", "A321", "E190"],
+    "TK": ["B738", "B772", "B77W", "A319", "A320", "A321", "A333"],
+    "FR": ["B738"],
+    "U2": ["A319", "A320", "A321"],
+}
 
 FLIGHT_CAT_COLOURS = {
     "VFR":  discord.Colour.green(),
@@ -234,7 +269,28 @@ async def load_openflights_data():
             print(f"⚠️  Route load failed: {e}")
 
 
-def get_live_vatsim_flights(pilots: list, dep: str, arr: str) -> list[dict]:
+def get_route_aircraft(dist_nm: float, airlines: list[str]) -> list[str]:
+    """Return realistic aircraft types for a given distance and airline list."""
+    # Get distance-band types
+    for band, (lo, hi, types) in ROUTE_AIRCRAFT_TYPES.items():
+        if lo <= dist_nm < hi:
+            band_types = types
+            break
+    else:
+        band_types = ["B738", "A320"]
+
+    # If we have airline info, prefer their actual fleet for this distance
+    fleet_types = []
+    for iata in airlines[:2]:
+        fleet = AIRLINE_FLEET.get(iata, [])
+        for ac in fleet:
+            spd = AIRCRAFT_SPEEDS.get(ac, 450)
+            approx_range = spd * 16  # ~16h max
+            if dist_nm <= approx_range and ac not in fleet_types:
+                fleet_types.append(ac)
+
+    result = fleet_types[:2] if fleet_types else band_types[:2]
+    return result
     """Find pilots currently flying this exact route on VATSIM."""
     dep_iata = _icao_to_iata.get(dep, dep[:3] if len(dep) == 4 else dep)
     arr_iata = _icao_to_iata.get(arr, arr[:3] if len(arr) == 4 else arr)
@@ -501,6 +557,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
                 continue
             real_flights  = get_real_flights(dep, arr)
             live_flights  = get_live_vatsim_flights(pilots, dep, arr)
+            typical_ac    = get_route_aircraft(dist, [f["iata"][:-4] if len(f["iata"]) > 4 else f["iata"] for f in real_flights])
             dep_atc = atc_map.get(dep,[])
             arr_atc = atc_map.get(arr,[])
             score = (
@@ -519,6 +576,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
                 "arr_atc": arr_atc,
                 "real_flights": real_flights,
                 "live_flights": live_flights,
+                "typical_ac":   typical_ac,
                 "score": score,
             })
 
@@ -544,8 +602,10 @@ async def build_route(ac: str, hours: float, origin: str = None):
         dep_atc_str = ", ".join(r["dep_atc"]) if r["dep_atc"] else "No ATC"
         arr_atc_str = ", ".join(r["arr_atc"]) if r["arr_atc"] else "No ATC"
 
+        ac_str = " / ".join(r["typical_ac"]) if r["typical_ac"] else ac
         lines = [
             f"**{r['dep']}** → **{r['arr']}** | {r['dist_nm']:.0f} NM | {flt_h}h {flt_m}m",
+            f"🛩️ Typical aircraft: {ac_str}",
             f"🎙️ Dep ATC: {dep_atc_str}",
             f"🎙️ Arr ATC: {arr_atc_str}",
         ]
@@ -578,6 +638,49 @@ async def build_route(ac: str, hours: float, origin: str = None):
 
     embed.set_footer(text="ATC coverage is live. Route data: OpenFlights.")
     return embed, None
+
+
+_faa_token: str = ""
+_faa_token_expiry: float = 0.0
+
+
+async def get_faa_token() -> str:
+    """Get or refresh FAA OAuth token."""
+    global _faa_token, _faa_token_expiry
+    import time
+    if _faa_token and time.time() < _faa_token_expiry - 60:
+        return _faa_token
+    if not FAA_CLIENT_ID or not FAA_CLIENT_SECRET:
+        return ""
+    headers = {"User-Agent": "AvBot/1.0"}
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": FAA_CLIENT_ID,
+        "client_secret": FAA_CLIENT_SECRET,
+    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.post(FAA_NOTAM_TOKEN_URL, data=data, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                j = await r.json()
+                _faa_token = j.get("access_token", "")
+                _faa_token_expiry = time.time() + j.get("expires_in", 3600)
+                return _faa_token
+    return ""
+
+
+async def fetch_notams(icao: str) -> list[dict]:
+    """Fetch NOTAMs for an airport from FAA API."""
+    token = await get_faa_token()
+    if not token:
+        return []
+    headers = {"User-Agent": "AvBot/1.0", "Authorization": f"Bearer {token}"}
+    params = {"icaoLocation": icao, "pageSize": 20, "pageNum": 1}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        async with session.get(FAA_NOTAM_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status == 200:
+                j = await r.json()
+                return j.get("items", [])
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -987,25 +1090,195 @@ async def prefix_route(ctx, aircraft: str = None, flight_time: str = None, origi
 
 
 # --------------------------------------------------------------------------- #
+# NOTAMs
+# --------------------------------------------------------------------------- #
+
+@bot.tree.command(name="notam", description="Show active NOTAMs for an airport (US airports, requires FAA key)")
+async def slash_notam(interaction: discord.Interaction, icao: str):
+    await interaction.response.defer()
+    await _send_notams(interaction.followup.send, icao.upper().strip())
+
+@bot.command(name="notam")
+async def prefix_notam(ctx, icao: str = None):
+    if not icao:
+        await ctx.send("Usage: `!notam <ICAO>` e.g. `!notam KLAX`")
+        return
+    await _send_notams(ctx.send, icao.upper().strip())
+
+async def _send_notams(send_fn, icao: str):
+    if not FAA_CLIENT_ID or not FAA_CLIENT_SECRET:
+        await send_fn(
+            "⚠️ NOTAMs require a free FAA API key.\n"
+            "1. Register at <https://api.faa.gov/s/>\n"
+            "2. Add `FAA_CLIENT_ID` and `FAA_CLIENT_SECRET` to your Railway environment variables.\n"
+            "US airports only."
+        )
+        return
+    notams = await fetch_notams(icao)
+    if not notams:
+        await send_fn(f"No active NOTAMs found for **{icao}**, or airport not in FAA system.")
+        return
+    embed = discord.Embed(title=f"📋 NOTAMs — {icao}", colour=discord.Colour.orange(), timestamp=datetime.now(timezone.utc))
+    for n in notams[:8]:
+        props    = n.get("properties", {})
+        core     = props.get("coreNOTAMData", {}).get("notam", {})
+        text     = core.get("text", "No text")
+        notam_id = core.get("id", "?")
+        eff_start = core.get("effectiveStart", "")
+        eff_end   = core.get("effectiveEnd", "PERM")
+        embed.add_field(
+            name=notam_id,
+            value=f"**Valid:** {eff_start[:10] if eff_start else '?'} → {eff_end[:10] if eff_end != 'PERM' else 'PERM'}\n```{text[:300]}```",
+            inline=False,
+        )
+    if len(notams) > 8:
+        embed.set_footer(text=f"Showing 8 of {len(notams)} NOTAMs — US airports only.")
+    else:
+        embed.set_footer(text="US airports only — FAA NOTAM API.")
+    await send_fn(embed=embed)
+
+
+# --------------------------------------------------------------------------- #
+# VATSIM Events
+# --------------------------------------------------------------------------- #
+
+@bot.tree.command(name="events", description="Show upcoming VATSIM events")
+async def slash_events(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await _send_events(interaction.followup.send)
+
+@bot.command(name="events")
+async def prefix_events(ctx):
+    await _send_events(ctx.send)
+
+async def _send_events(send_fn):
+    data = await fetch_json(VATSIM_EVENTS_URL)
+    if not data:
+        await send_fn("❌ Could not reach VATSIM Events API.")
+        return
+    events = data.get("data", [])
+    if not events:
+        await send_fn("No upcoming VATSIM events found.")
+        return
+
+    now = datetime.now(timezone.utc)
+    upcoming = []
+    for e in events:
+        try:
+            start = datetime.fromisoformat(e["start_time"].replace("Z", "+00:00"))
+            end   = datetime.fromisoformat(e["end_time"].replace("Z", "+00:00"))
+            if end > now:
+                upcoming.append((start, e))
+        except Exception:
+            pass
+    upcoming.sort(key=lambda x: x[0])
+
+    embed = discord.Embed(title="📅 Upcoming VATSIM Events", colour=discord.Colour.blurple(), timestamp=now)
+    for start, e in upcoming[:8]:
+        name     = e.get("name", "Unnamed Event")
+        link     = e.get("link", "")
+        airports = [a.get("icao","") for a in e.get("airports", [])]
+        routes   = e.get("routes", [])
+        start_str = start.strftime("%b %d %H:%MZ")
+        try:
+            end_dt  = datetime.fromisoformat(e["end_time"].replace("Z", "+00:00"))
+            end_str = end_dt.strftime("%b %d %H:%MZ")
+        except Exception:
+            end_str = "?"
+
+        is_live = start <= now
+        status  = "🟢 **LIVE NOW**" if is_live else f"🕐 {start_str} → {end_str}"
+        val_parts = [status]
+        if airports:
+            val_parts.append(f"✈️ {', '.join(airports[:5])}")
+        if routes:
+            r0 = routes[0]
+            val_parts.append(f"🗺️ {r0.get('departure','?')} → {r0.get('arrival','?')}")
+        if link:
+            val_parts.append(f"[More info]({link})")
+        embed.add_field(name=name, value="\n".join(val_parts), inline=False)
+
+    embed.set_footer(text="Source: my.vatsim.net")
+    await send_fn(embed=embed)
+
+
+# --------------------------------------------------------------------------- #
+# PIREPs
+# --------------------------------------------------------------------------- #
+
+@bot.tree.command(name="pirep", description="Show recent PIREPs near an airport")
+async def slash_pirep(interaction: discord.Interaction, icao: str):
+    await interaction.response.defer()
+    await _send_pireps(interaction.followup.send, icao.upper().strip())
+
+@bot.command(name="pirep")
+async def prefix_pirep(ctx, icao: str = None):
+    if not icao:
+        await ctx.send("Usage: `!pirep <ICAO>` e.g. `!pirep KLAX`")
+        return
+    await _send_pireps(ctx.send, icao.upper().strip())
+
+async def _send_pireps(send_fn, icao: str):
+    data = await fetch_json(AWC_PIREP_URL, {"id": icao, "format": "json", "age": 2, "distance": 100})
+    if not data or not isinstance(data, list) or not data:
+        await send_fn(f"No PIREPs found near **{icao}** in the last 2 hours.")
+        return
+    embed = discord.Embed(title=f"🛩️ PIREPs near {icao}", colour=discord.Colour.teal(), timestamp=datetime.now(timezone.utc))
+    for p in data[:8]:
+        raw      = p.get("rawOb", p.get("raw", "N/A"))
+        obs_time = p.get("obsTime", "")
+        ac_type  = p.get("acType", "")
+        altitude = p.get("altitude", "")
+        turb     = p.get("turbulenceCondition", "")
+        ice      = p.get("icingCondition", "")
+        sky      = p.get("skyCond", "")
+        wx       = p.get("wxString", "")
+        try:
+            obs_dt = datetime.fromtimestamp(int(obs_time), tz=timezone.utc).strftime("%H:%MZ")
+        except Exception:
+            obs_dt = "?"
+        parts = []
+        if ac_type:  parts.append(f"**Aircraft:** {ac_type}")
+        if altitude: parts.append(f"**Alt:** FL{str(altitude).zfill(3)}")
+        if turb:     parts.append(f"**Turbulence:** {turb}")
+        if ice:      parts.append(f"**Icing:** {ice}")
+        if sky:      parts.append(f"**Sky:** {sky}")
+        if wx:       parts.append(f"**WX:** {wx}")
+        parts.append(f"```{raw[:200]}```")
+        embed.add_field(name=f"PIREP @ {obs_dt}", value="\n".join(parts), inline=False)
+    embed.set_footer(text="aviationweather.gov — within 100NM, last 2hrs")
+    await send_fn(embed=embed)
+
+
+# --------------------------------------------------------------------------- #
 # Help
 # --------------------------------------------------------------------------- #
 
 def _help_embed() -> discord.Embed:
     e = discord.Embed(title="✈️ Aviation Bot — Commands", description="Works with both `!prefix` and `/slash` commands.", colour=discord.Colour.gold())
-    e.add_field(name="🌤️ Weather", value="`!metar` `/metar` — METAR\n`!taf` `/taf` — TAF\n`!wx` `/wx` — METAR + TAF", inline=False)
+    e.add_field(name="🌤️ Weather", value=(
+        "`!metar` `/metar` — METAR\n"
+        "`!taf` `/taf` — TAF\n"
+        "`!wx` `/wx` — METAR + TAF\n"
+        "`!pirep` `/pirep` — PIREPs near airport"
+    ), inline=False)
     e.add_field(name="🛩️ VATSIM", value=(
         "`!vatsim` `/vatsim_stats` — Network totals\n"
         "`!pilot` `/pilot` — Pilot by callsign\n"
         "`!find` `/find_pilot` — Search callsign or CID\n"
         "`!atc` `/atc` — ATC at a facility\n"
         "`!atis` `/atis` — ATIS\n"
-        "`!traffic` `/traffic` — Departures & arrivals"
+        "`!traffic` `/traffic` — Departures & arrivals\n"
+        "`!events` `/events` — Upcoming VATSIM events"
     ), inline=False)
     e.add_field(name="🗺️ Route Generator", value=(
         "`!route <aircraft> <time> [origin]`\n"
-        "`/route <aircraft> <time> [origin]`\n"
         "Examples: `!route B738 2h` · `!route A320 90m EGLL`\n"
-        "Shows real-world airline flights on the route + SimBrief link."
+        "Shows typical aircraft, live VATSIM traffic, real airlines + SimBrief."
+    ), inline=False)
+    e.add_field(name="📋 NOTAMs", value=(
+        "`!notam` `/notam` — Active NOTAMs for an airport\n"
+        "Requires free FAA API key (US airports only)."
     ), inline=False)
     return e
 
