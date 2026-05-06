@@ -1,6 +1,4 @@
-# ✈️ SkyWatch — Aviation Discord Bot
 
-A zero-cost, zero-API-key Discord bot for aviation enthusiasts, sim pilots, and VATSIM users.
 
 ## Data Sources (both free, no signup needed)
 
