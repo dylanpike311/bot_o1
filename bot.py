@@ -124,10 +124,14 @@ AIRLINE_INFO = {
     "MS": ("MSR", "EgyptAir",            (1,    999)),
 }
 
-# in-memory route table: (src_icao, dst_icao) -> [airline_iata, ...]
+# in-memory route table: (src_iata, dst_iata) -> [airline_iata, ...]
 _route_table: dict[tuple, list] = {}
-# icao -> (lat, lon, name)
+# icao -> (lat, lon, name, iata)
 _airport_table: dict[str, tuple] = {}
+# iata (3-letter) -> icao (4-letter)
+_iata_to_icao: dict[str, str] = {}
+# icao (4-letter) -> iata (3-letter)
+_icao_to_iata: dict[str, str] = {}
 # iata -> (icao_callsign, full_name)  — populated from airlines.dat at startup
 _airline_db: dict[str, tuple] = {}
 
@@ -141,7 +145,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 async def load_openflights_data():
     """Download and parse OpenFlights airports, airlines + routes into memory."""
-    global _route_table, _airport_table, _airline_db
+    global _route_table, _airport_table, _airline_db, _iata_to_icao, _icao_to_iata
     headers = {"User-Agent": "AvBot/1.0"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -169,11 +173,11 @@ async def load_openflights_data():
                     print(f"✅ Airlines loaded: {len(_airline_db)}")
         except Exception as e:
             print(f"⚠️  Airline load failed: {e}")
-            # Fall back to static table only
             for iata, info in AIRLINE_INFO.items():
                 _airline_db[iata] = (info[0], info[1])
 
         # --- airports ---
+        # columns: id, name, city, country, iata, icao, lat, lon, ...
         try:
             async with session.get(OF_AIRPORTS_URL, timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status == 200:
@@ -181,21 +185,27 @@ async def load_openflights_data():
                     for row in csv.reader(io.StringIO(text)):
                         if len(row) < 8:
                             continue
-                        # id, name, city, country, iata, icao, lat, lon
+                        iata = row[4].strip().upper()
                         icao = row[5].strip().upper()
                         name = row[1].strip().strip('"')
                         try:
                             lat = float(row[6])
                             lon = float(row[7])
-                            if icao and icao != r"\N" and len(icao) == 4:
-                                _airport_table[icao] = (lat, lon, name)
                         except ValueError:
-                            pass
-                    print(f"✅ Airports loaded: {len(_airport_table)}")
+                            continue
+                        if icao and icao != r"\N" and len(icao) == 4:
+                            _airport_table[icao] = (lat, lon, name, iata if iata and iata != r"\N" else "")
+                        if (iata and iata != r"\N" and len(iata) == 3
+                                and icao and icao != r"\N" and len(icao) == 4):
+                            _iata_to_icao[iata] = icao
+                            _icao_to_iata[icao] = iata
+                    print(f"✅ Airports loaded: {len(_airport_table)}, IATA↔ICAO pairs: {len(_iata_to_icao)}")
         except Exception as e:
             print(f"⚠️  Airport load failed: {e}")
 
         # --- routes ---
+        # routes.dat uses IATA codes for airports (3-letter), not ICAO
+        # columns: airline_iata, airline_id, src_iata, src_id, dst_iata, dst_id, codeshare, stops, equip
         try:
             async with session.get(OF_ROUTES_URL, timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status == 200:
@@ -204,12 +214,15 @@ async def load_openflights_data():
                     for row in csv.reader(io.StringIO(text)):
                         if len(row) < 5:
                             continue
-                        # airline_iata, airline_id, src_icao, src_id, dst_icao, dst_id, ...
                         airline = row[0].strip().upper()
-                        src     = row[2].strip().upper()
-                        dst     = row[4].strip().upper()
-                        if (not src or not dst or src == r"\N" or dst == r"\N"
-                                or len(src) != 4 or len(dst) != 4):
+                        src     = row[2].strip().upper()  # IATA airport code
+                        dst     = row[4].strip().upper()  # IATA airport code
+                        # routes.dat mixes IATA (3-char) and ICAO (4-char) — normalise to IATA
+                        if len(src) == 4:
+                            src = _icao_to_iata.get(src, src)
+                        if len(dst) == 4:
+                            dst = _icao_to_iata.get(dst, dst)
+                        if not src or not dst or src == r"\N" or dst == r"\N":
                             continue
                         key = (src, dst)
                         _route_table.setdefault(key, [])
@@ -221,12 +234,14 @@ async def load_openflights_data():
             print(f"⚠️  Route load failed: {e}")
 
 
-def get_real_flights(src: str, dst: str) -> list[dict]:
-    """Return list of realistic flights for a route pair.
-    Checks both directions since OpenFlights can be inconsistent."""
-    # Try both src->dst and dst->src (routes are directional in OpenFlights)
-    airlines = list(_route_table.get((src, dst), []))
-    for a in _route_table.get((dst, src), []):
+def get_real_flights(src_icao: str, dst_icao: str) -> list[dict]:
+    """Return real-world flights for a route pair using IATA route lookup."""
+    # Convert ICAO -> IATA for route table lookup
+    src_iata = _icao_to_iata.get(src_icao, src_icao[:3] if len(src_icao) == 4 else src_icao)
+    dst_iata = _icao_to_iata.get(dst_icao, dst_icao[:3] if len(dst_icao) == 4 else dst_icao)
+
+    airlines = list(_route_table.get((src_iata, dst_iata), []))
+    for a in _route_table.get((dst_iata, src_iata), []):
         if a not in airlines:
             airlines.append(a)
 
@@ -383,12 +398,17 @@ async def build_route(ac: str, hours: float, origin: str = None):
     if not data:
         return None, "Could not reach VATSIM data feed."
 
-    # Build ATC coverage map
+    # Build ATC coverage map — VATSIM callsigns use 3 or 4-letter airport prefixes
     atc_airports, atc_map = set(), {}
     for c in data.get("controllers",[]):
         parts = c.get("callsign","").split("_")
         if len(parts) >= 2:
-            icao = parts[0].upper()
+            prefix = parts[0].upper()
+            # If 3-letter, try to resolve to ICAO via our map
+            if len(prefix) == 3:
+                icao = _iata_to_icao.get(prefix, prefix)
+            else:
+                icao = prefix
             atc_airports.add(icao)
             atc_map.setdefault(icao,[]).append(c.get("callsign",""))
 
@@ -400,7 +420,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
     if _airport_table:
         for icao in atc_airports:
             if icao in _airport_table:
-                lat, lon, name = _airport_table[icao]
+                lat, lon, name, _ = _airport_table[icao]
                 airports[icao] = {"lat": lat, "lon": lon, "name": name}
     
     # Fill gaps via METAR
@@ -424,7 +444,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
         origin = origin.upper()
         if origin not in airports:
             if origin in _airport_table:
-                lat, lon, name = _airport_table[origin]
+                lat, lon, name, _ = _airport_table[origin]
                 airports[origin] = {"lat":lat,"lon":lon,"name":name}
                 airport_list.append(origin)
             else:
