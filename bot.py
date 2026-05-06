@@ -553,7 +553,11 @@ async def build_route(ac: str, hours: float, origin: str = None):
                 continue
             real_flights  = get_real_flights(dep, arr)
             live_flights  = get_live_vatsim_flights(pilots, dep, arr)
-            typical_ac    = get_route_aircraft(dist, [f["iata"][:-4] if len(f["iata"]) > 4 else f["iata"] for f in real_flights])
+            # Extract airline IATA codes from real_flights for fleet lookup
+            airline_iatas = list(_route_table.get(
+                (_icao_to_iata.get(dep, dep), _icao_to_iata.get(arr, arr)), []
+            ))
+            typical_ac    = get_route_aircraft(dist, airline_iatas)
             dep_atc = atc_map.get(dep,[])
             arr_atc = atc_map.get(arr,[])
             score = (
