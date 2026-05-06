@@ -95,8 +95,8 @@ AIRLINE_INFO = {
 _route_table: dict[tuple, list] = {}
 # icao -> (lat, lon, name)
 _airport_table: dict[str, tuple] = {}
-# iata -> icao
-_airline_iata_to_icao: dict[str, str] = {}
+# iata -> (icao_callsign, full_name)  — populated from airlines.dat at startup
+_airline_db: dict[str, tuple] = {}
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -107,11 +107,39 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # --------------------------------------------------------------------------- #
 
 async def load_openflights_data():
-    """Download and parse OpenFlights airports + routes into memory."""
-    global _route_table, _airport_table, _airline_iata_to_icao
+    """Download and parse OpenFlights airports, airlines + routes into memory."""
+    global _route_table, _airport_table, _airline_db
     headers = {"User-Agent": "AvBot/1.0"}
 
     async with aiohttp.ClientSession(headers=headers) as session:
+
+        # --- airlines ---
+        try:
+            async with session.get(OF_AIRLINES_URL, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status == 200:
+                    text = await r.text(encoding="utf-8", errors="replace")
+                    # columns: id, name, alias, iata, icao, callsign, country, active
+                    for row in csv.reader(io.StringIO(text)):
+                        if len(row) < 6:
+                            continue
+                        iata   = row[3].strip().upper()
+                        icao   = row[4].strip().upper()
+                        name   = row[1].strip().strip('"')
+                        active = row[7].strip() if len(row) > 7 else "Y"
+                        if (iata and iata != r"\N" and len(iata) <= 3
+                                and icao and icao != r"\N" and len(icao) == 3
+                                and active == "Y"):
+                            _airline_db[iata] = (icao, name)
+                    # Overlay our curated table (has number ranges)
+                    for iata, info in AIRLINE_INFO.items():
+                        _airline_db[iata] = (info[0], info[1])
+                    print(f"✅ Airlines loaded: {len(_airline_db)}")
+        except Exception as e:
+            print(f"⚠️  Airline load failed: {e}")
+            # Fall back to static table only
+            for iata, info in AIRLINE_INFO.items():
+                _airline_db[iata] = (info[0], info[1])
+
         # --- airports ---
         try:
             async with session.get(OF_AIRPORTS_URL, timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -159,21 +187,28 @@ async def load_openflights_data():
         except Exception as e:
             print(f"⚠️  Route load failed: {e}")
 
-    # Build reverse airline lookup from our static table
-    for iata, info in AIRLINE_INFO.items():
-        _airline_iata_to_icao[iata] = info[0]
-
 
 def get_real_flights(src: str, dst: str) -> list[dict]:
     """Return list of realistic flights for a route pair."""
     airlines = _route_table.get((src, dst), [])
     results = []
-    for iata in airlines[:4]:  # cap at 4 airlines per route
-        info = AIRLINE_INFO.get(iata)
-        if not info:
-            continue
-        icao_code, name, num_range = info
-        flt_num = random.randint(num_range[0], num_range[1])
+    for iata in airlines[:4]:
+        # Try curated table first (has flight number ranges)
+        curated = AIRLINE_INFO.get(iata)
+        if curated:
+            icao_code, name, num_range = curated
+            flt_num = random.randint(num_range[0], num_range[1])
+        else:
+            # Fall back to dynamically loaded airline db
+            db_entry = _airline_db.get(iata)
+            if not db_entry:
+                # Last resort: use IATA as pseudo-callsign
+                icao_code = iata
+                name = iata
+                flt_num = random.randint(1, 999)
+            else:
+                icao_code, name = db_entry
+                flt_num = random.randint(1, 999)
         results.append({
             "callsign": f"{icao_code}{flt_num}",
             "iata":     f"{iata}{flt_num}",
