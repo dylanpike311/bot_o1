@@ -611,8 +611,15 @@ async def build_route(ac: str, hours: float, origin: str = None):
     for i, r in enumerate(top, 1):
         flt_h = int(r["flight_time_h"])
         flt_m = int((r["flight_time_h"] % 1) * 60)
-        dep_atc_str = ", ".join(r["dep_atc"]) if r["dep_atc"] else "No ATC"
-        arr_atc_str = ", ".join(r["arr_atc"]) if r["arr_atc"] else "No ATC"
+        # Truncate ATC lists to avoid hitting Discord's 1024 char field limit
+        dep_atc_list = r["dep_atc"][:5]
+        arr_atc_list = r["arr_atc"][:5]
+        dep_atc_str = ", ".join(dep_atc_list) if dep_atc_list else "No ATC"
+        arr_atc_str = ", ".join(arr_atc_list) if arr_atc_list else "No ATC"
+        if len(r["dep_atc"]) > 5:
+            dep_atc_str += f" +{len(r['dep_atc'])-5} more"
+        if len(r["arr_atc"]) > 5:
+            arr_atc_str += f" +{len(r['arr_atc'])-5} more"
 
         ac_str = " / ".join(r["typical_ac"]) if r["typical_ac"] else ac
         lines = [
@@ -646,7 +653,8 @@ async def build_route(ac: str, hours: float, origin: str = None):
             if not r["live_flights"]:
                 lines.append("⚠️ No airline route data for this pair")
 
-        embed.add_field(name=f"Option {i}", value="\n".join(lines), inline=False)
+        field_value = "\n".join(lines)[:1020]  # Discord limit is 1024
+        embed.add_field(name=f"Option {i}", value=field_value, inline=False)
 
     embed.set_footer(text="ATC coverage is live. Route data: OpenFlights.")
     return embed, None
