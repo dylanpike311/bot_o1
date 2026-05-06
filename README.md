@@ -1,1 +1,1 @@
-# A bot.
+a bot for testing purposes
