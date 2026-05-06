@@ -234,6 +234,28 @@ async def load_openflights_data():
             print(f"⚠️  Route load failed: {e}")
 
 
+def get_live_vatsim_flights(pilots: list, dep: str, arr: str) -> list[dict]:
+    """Find pilots currently flying this exact route on VATSIM."""
+    dep_iata = _icao_to_iata.get(dep, dep[:3] if len(dep) == 4 else dep)
+    arr_iata = _icao_to_iata.get(arr, arr[:3] if len(arr) == 4 else arr)
+    matches = []
+    for p in pilots:
+        fp = p.get("flight_plan") or {}
+        p_dep = fp.get("departure", "").upper()
+        p_arr = fp.get("arrival", "").upper()
+        # Match on ICAO or IATA for both dep and arr
+        dep_match = p_dep in (dep, dep_iata)
+        arr_match = p_arr in (arr, arr_iata)
+        if dep_match and arr_match:
+            matches.append({
+                "callsign": p.get("callsign", "?"),
+                "alt":      p.get("altitude", 0),
+                "gs":       p.get("groundspeed", 0),
+                "aircraft": fp.get("aircraft_faa", fp.get("aircraft", "?")),
+            })
+    return matches[:3]  # cap at 3 live flights
+
+
 def get_real_flights(src_icao: str, dst_icao: str) -> list[dict]:
     """Return real-world flights for a route pair using IATA route lookup."""
     # Convert ICAO -> IATA for route table lookup
@@ -461,6 +483,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
 
     # Find candidate pairs
     candidates = []
+    pilots = data.get("pilots", [])
     origins_to_check = [origin] if origin else random.sample(airport_list, min(25, len(airport_list)))
 
     for dep in origins_to_check:
@@ -476,10 +499,16 @@ async def build_route(ac: str, hours: float, origin: str = None):
             dist = haversine_nm(dep_info["lat"],dep_info["lon"],arr_info["lat"],arr_info["lon"])
             if not (min_nm <= dist <= max_nm):
                 continue
-            real_flights = get_real_flights(dep, arr)
+            real_flights  = get_real_flights(dep, arr)
+            live_flights  = get_live_vatsim_flights(pilots, dep, arr)
             dep_atc = atc_map.get(dep,[])
             arr_atc = atc_map.get(arr,[])
-            score = (2 if dep in atc_airports else 0) + (2 if arr in atc_airports else 0) + (3 if real_flights else 0)
+            score = (
+                (2 if dep in atc_airports else 0) +
+                (2 if arr in atc_airports else 0) +
+                (3 if real_flights else 0) +
+                (5 if live_flights else 0)  # prioritise routes with live traffic
+            )
             candidates.append({
                 "dep": dep, "arr": arr,
                 "dep_name": airports[dep].get("name", dep),
@@ -489,6 +518,7 @@ async def build_route(ac: str, hours: float, origin: str = None):
                 "dep_atc": dep_atc,
                 "arr_atc": arr_atc,
                 "real_flights": real_flights,
+                "live_flights": live_flights,
                 "score": score,
             })
 
@@ -514,24 +544,35 @@ async def build_route(ac: str, hours: float, origin: str = None):
         dep_atc_str = ", ".join(r["dep_atc"]) if r["dep_atc"] else "No ATC"
         arr_atc_str = ", ".join(r["arr_atc"]) if r["arr_atc"] else "No ATC"
 
-        # Build SimBrief links — one generic + one per real flight
         lines = [
             f"**{r['dep']}** → **{r['arr']}** | {r['dist_nm']:.0f} NM | {flt_h}h {flt_m}m",
             f"🎙️ Dep ATC: {dep_atc_str}",
             f"🎙️ Arr ATC: {arr_atc_str}",
         ]
 
+        # Live VATSIM flights on this route right now
+        if r["live_flights"]:
+            lines.append("🟢 **Flying this route on VATSIM right now:**")
+            for lf in r["live_flights"]:
+                alt_str = f"FL{int(lf['alt'])//100}" if lf['alt'] else "?"
+                lines.append(f"• **{lf['callsign']}** {lf['aircraft']} — {alt_str} @ {lf['gs']}kt")
+
+        # Real-world airline routes with SimBrief links
         if r["real_flights"]:
-            lines.append("**Real-world flights on this route:**")
+            lines.append("✈️ **Real-world airlines on this route:**")
+            lines.append("*Flight numbers are examples — [look up real numbers on Google](https://www.google.com/search?q=flight+number)*")
             for f in r["real_flights"]:
                 icao_code = f["callsign"][:3] if len(f["callsign"]) > 3 else f["callsign"]
                 fnum = f["callsign"][3:]
                 sb = simbrief_url(r["dep"], r["arr"], ac, icao_code, fnum)
-                lines.append(f"• {f['callsign']} ({f['airline']}) — [Plan in SimBrief]({sb})")
+                google_q = f"{f['airline']} {r['dep']} {r['arr']} flight number".replace(" ", "+")
+                google = f"https://www.google.com/search?q={google_q}"
+                lines.append(f"• {f['airline']} — [SimBrief]({sb}) · [Find real flight #]({google})")
         else:
             sb = simbrief_url(r["dep"], r["arr"], ac)
-            lines.append(f"⚠️ No real-world airline routes found for this pair")
-            lines.append(f"[📋 Plan in SimBrief anyway]({sb})")
+            lines.append(f"[📋 Plan in SimBrief]({sb})")
+            if not r["live_flights"]:
+                lines.append("⚠️ No airline route data for this pair")
 
         embed.add_field(name=f"Option {i}", value="\n".join(lines), inline=False)
 
