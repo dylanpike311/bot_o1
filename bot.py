@@ -29,13 +29,46 @@ FLIGHT_CAT_COLOURS = {
 }
 
 AIRCRAFT_SPEEDS = {
-    "B737": 450, "B738": 450, "B739": 450,
-    "B744": 490, "B748": 490, "B772": 490, "B77W": 490, "B788": 490, "B789": 490,
-    "A319": 450, "A320": 450, "A321": 450,
-    "A332": 490, "A333": 490, "A343": 490, "A359": 490, "A35K": 490,
-    "B190": 280, "DH8D": 280, "E175": 420, "E190": 430,
-    "C172": 120, "C208": 180, "PC12": 270,
-    "CRJ2": 430, "CRJ7": 430, "CRJ9": 430,
+    # Boeing narrowbody
+    "B737": 450, "B738": 450, "B739": 450, "B736": 450, "B735": 430,
+    # Boeing widebody
+    "B744": 490, "B748": 490, "B742": 480,
+    "B772": 490, "B77W": 490, "B77L": 490, "B773": 490,
+    "B788": 490, "B789": 490, "B78X": 490,
+    # Airbus narrowbody
+    "A318": 440, "A319": 450, "A320": 450, "A321": 450,
+    "A20N": 450, "A21N": 450,  # NEO variants
+    # Airbus widebody
+    "A332": 490, "A333": 490, "A338": 490, "A339": 490,
+    "A343": 490, "A345": 490, "A346": 490,
+    "A359": 490, "A35K": 490, "A350": 490,  # A350 family
+    "A380": 490, "A388": 490,
+    # Regional jets
+    "B190": 280, "DH8D": 280, "DH8C": 260, "DH8B": 240, "DH8A": 220,
+    "E170": 410, "E175": 420, "E190": 430, "E195": 430,
+    "E7W":  430, "E75L": 420, "E75S": 420,
+    "CRJ2": 430, "CRJ7": 430, "CRJ9": 430, "CRJX": 430,
+    "AT72": 270, "AT76": 270, "AT45": 260,
+    # GA / turboprop
+    "C172": 120, "C208": 180, "PC12": 270, "TBM9": 300, "SR22": 180,
+    "BE20": 260, "BE9L": 220,
+    # Other
+    "MD11": 490, "DC10": 480, "L101": 480,
+    "SF34": 250, "JS41": 230,
+}
+
+# Friendly aliases (what users might type -> canonical key)
+AIRCRAFT_ALIASES = {
+    "A350":  "A359",
+    "A35K":  "A35K",
+    "A380":  "A388",
+    "B737":  "B738",
+    "B777":  "B77W",
+    "B787":  "B789",
+    "B747":  "B744",
+    "A330":  "A333",
+    "A320N": "A20N",
+    "A321N": "A21N",
 }
 
 # Airline IATA → (ICAO callsign, full name, typical flight number range)
@@ -189,26 +222,28 @@ async def load_openflights_data():
 
 
 def get_real_flights(src: str, dst: str) -> list[dict]:
-    """Return list of realistic flights for a route pair."""
-    airlines = _route_table.get((src, dst), [])
+    """Return list of realistic flights for a route pair.
+    Checks both directions since OpenFlights can be inconsistent."""
+    # Try both src->dst and dst->src (routes are directional in OpenFlights)
+    airlines = list(_route_table.get((src, dst), []))
+    for a in _route_table.get((dst, src), []):
+        if a not in airlines:
+            airlines.append(a)
+
     results = []
     for iata in airlines[:4]:
-        # Try curated table first (has flight number ranges)
         curated = AIRLINE_INFO.get(iata)
         if curated:
             icao_code, name, num_range = curated
             flt_num = random.randint(num_range[0], num_range[1])
         else:
-            # Fall back to dynamically loaded airline db
             db_entry = _airline_db.get(iata)
-            if not db_entry:
-                # Last resort: use IATA as pseudo-callsign
+            if db_entry:
+                icao_code, name = db_entry
+            else:
                 icao_code = iata
                 name = iata
-                flt_num = random.randint(1, 999)
-            else:
-                icao_code, name = db_entry
-                flt_num = random.randint(1, 999)
+            flt_num = random.randint(1, 999)
         results.append({
             "callsign": f"{icao_code}{flt_num}",
             "iata":     f"{iata}{flt_num}",
@@ -337,6 +372,8 @@ async def get_vatsim():    return await fetch_json(VATSIM_DATA_URL)
 # --------------------------------------------------------------------------- #
 
 async def build_route(ac: str, hours: float, origin: str = None):
+    # Resolve aliases (e.g. A350 -> A359)
+    ac = AIRCRAFT_ALIASES.get(ac, ac)
     speed      = AIRCRAFT_SPEEDS.get(ac, 450)
     target_nm  = speed * hours
     min_nm     = target_nm * 0.75
@@ -473,7 +510,8 @@ async def build_route(ac: str, hours: float, origin: str = None):
                 lines.append(f"• {f['callsign']} ({f['airline']}) — [Plan in SimBrief]({sb})")
         else:
             sb = simbrief_url(r["dep"], r["arr"], ac)
-            lines.append(f"[📋 Plan in SimBrief]({sb})")
+            lines.append(f"⚠️ No real-world airline routes found for this pair")
+            lines.append(f"[📋 Plan in SimBrief anyway]({sb})")
 
         embed.add_field(name=f"Option {i}", value="\n".join(lines), inline=False)
 
