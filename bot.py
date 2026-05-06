@@ -91,15 +91,25 @@ AIRCRAFT_SPEEDS = {
 # Friendly aliases (what users might type -> canonical key)
 AIRCRAFT_ALIASES = {
     "A350":  "A359",
-    "A35K":  "A35K",
     "A380":  "A388",
     "B737":  "B738",
     "B777":  "B77W",
     "B787":  "B789",
     "B747":  "B744",
+    "B757":  "B752",
+    "B767":  "B764",
     "A330":  "A333",
+    "A340":  "A343",
+    "A220":  "BCS3",
     "A320N": "A20N",
     "A321N": "A21N",
+    "E170":  "E170",
+    "E175":  "E75L",
+    "E190":  "E190",
+    "E195":  "E195",
+    "CRJ":   "CRJ9",
+    "Q400":  "DH8D",
+    "ATR72": "AT72",
 }
 
 # Airline IATA → (ICAO callsign, full name, typical flight number range)
@@ -1235,7 +1245,7 @@ def _help_embed() -> discord.Embed:
     ), inline=False)
     e.add_field(name="📋 NOTAMs", value=(
         "`!notam` `/notam` — Active NOTAMs for an airport\n"
-        "Requires free FAA API key (US airports only)."
+        "Provides direct links to FAA NOTAM search & SkyVector."
     ), inline=False)
     return e
 
