@@ -13,16 +13,12 @@ from urllib.parse import urlencode
 load_dotenv()
 
 DISCORD_TOKEN     = os.getenv("DISCORD_TOKEN")
-FAA_CLIENT_ID     = os.getenv("FAA_CLIENT_ID", "")
-FAA_CLIENT_SECRET = os.getenv("FAA_CLIENT_SECRET", "")
 
 VATSIM_DATA_URL   = "https://data.vatsim.net/v3/vatsim-data.json"
 VATSIM_EVENTS_URL = "https://my.vatsim.net/api/v1/events/all"
 AWC_METAR_URL     = "https://aviationweather.gov/api/data/metar"
 AWC_TAF_URL       = "https://aviationweather.gov/api/data/taf"
 AWC_PIREP_URL     = "https://aviationweather.gov/api/data/pirep"
-FAA_NOTAM_TOKEN_URL = "https://external-api.faa.gov/auth/oauth/token"
-FAA_NOTAM_URL       = "https://external-api.faa.gov/notamapi/v1/notams"
 OF_ROUTES_URL     = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/routes.dat"
 OF_AIRPORTS_URL   = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
 OF_AIRLINES_URL   = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airlines.dat"
@@ -640,49 +636,6 @@ async def build_route(ac: str, hours: float, origin: str = None):
     return embed, None
 
 
-_faa_token: str = ""
-_faa_token_expiry: float = 0.0
-
-
-async def get_faa_token() -> str:
-    """Get or refresh FAA OAuth token."""
-    global _faa_token, _faa_token_expiry
-    import time
-    if _faa_token and time.time() < _faa_token_expiry - 60:
-        return _faa_token
-    if not FAA_CLIENT_ID or not FAA_CLIENT_SECRET:
-        return ""
-    headers = {"User-Agent": "AvBot/1.0"}
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": FAA_CLIENT_ID,
-        "client_secret": FAA_CLIENT_SECRET,
-    }
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.post(FAA_NOTAM_TOKEN_URL, data=data, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                j = await r.json()
-                _faa_token = j.get("access_token", "")
-                _faa_token_expiry = time.time() + j.get("expires_in", 3600)
-                return _faa_token
-    return ""
-
-
-async def fetch_notams(icao: str) -> list[dict]:
-    """Fetch NOTAMs for an airport from FAA API."""
-    token = await get_faa_token()
-    if not token:
-        return []
-    headers = {"User-Agent": "AvBot/1.0", "Authorization": f"Bearer {token}"}
-    params = {"icaoLocation": icao, "pageSize": 20, "pageNum": 1}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        async with session.get(FAA_NOTAM_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            if r.status == 200:
-                j = await r.json()
-                return j.get("items", [])
-    return []
-
-
 # --------------------------------------------------------------------------- #
 # Bot events
 # --------------------------------------------------------------------------- #
@@ -1106,35 +1059,35 @@ async def prefix_notam(ctx, icao: str = None):
     await _send_notams(ctx.send, icao.upper().strip())
 
 async def _send_notams(send_fn, icao: str):
-    if not FAA_CLIENT_ID or not FAA_CLIENT_SECRET:
-        await send_fn(
-            "⚠️ NOTAMs require a free FAA API key.\n"
-            "1. Register at <https://api.faa.gov/s/>\n"
-            "2. Add `FAA_CLIENT_ID` and `FAA_CLIENT_SECRET` to your Railway environment variables.\n"
-            "US airports only."
-        )
-        return
-    notams = await fetch_notams(icao)
-    if not notams:
-        await send_fn(f"No active NOTAMs found for **{icao}**, or airport not in FAA system.")
-        return
-    embed = discord.Embed(title=f"📋 NOTAMs — {icao}", colour=discord.Colour.orange(), timestamp=datetime.now(timezone.utc))
-    for n in notams[:8]:
-        props    = n.get("properties", {})
-        core     = props.get("coreNOTAMData", {}).get("notam", {})
-        text     = core.get("text", "No text")
-        notam_id = core.get("id", "?")
-        eff_start = core.get("effectiveStart", "")
-        eff_end   = core.get("effectiveEnd", "PERM")
-        embed.add_field(
-            name=notam_id,
-            value=f"**Valid:** {eff_start[:10] if eff_start else '?'} → {eff_end[:10] if eff_end != 'PERM' else 'PERM'}\n```{text[:300]}```",
-            inline=False,
-        )
-    if len(notams) > 8:
-        embed.set_footer(text=f"Showing 8 of {len(notams)} NOTAMs — US airports only.")
+    # Determine US vs international by prefix
+    us_prefixes = ("K", "P")  # K = contiguous US, P = Pacific/Hawaii/Alaska
+    is_us = icao.startswith(us_prefixes)
+
+    if is_us:
+        url = f"https://notams.aim.faa.gov/notamSearch/search?searchType=0&searchfacility={icao}"
     else:
-        embed.set_footer(text="US airports only — FAA NOTAM API.")
+        url = f"https://www.notams.faa.gov/dinsQueryWeb/queryRetrievalMapAction.do?reportType=Raw&retrieveLocId={icao}"
+
+    # Also build a SkyVector link which shows NOTAMs on a map
+    skyvector = f"https://skyvector.com/airport/{icao}"
+
+    embed = discord.Embed(
+        title=f"📋 NOTAMs — {icao}",
+        description=f"Click below to view active NOTAMs for **{icao}**.",
+        colour=discord.Colour.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="🔗 Official NOTAM Search",
+        value=f"[Open FAA NOTAM Search for {icao}]({url})",
+        inline=False,
+    )
+    embed.add_field(
+        name="🗺️ SkyVector",
+        value=f"[View {icao} on SkyVector (charts + NOTAMs)]({skyvector})",
+        inline=False,
+    )
+    embed.set_footer(text="FAA NOTAM Search — official source, always current")
     await send_fn(embed=embed)
 
 
