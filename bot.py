@@ -297,6 +297,9 @@ def get_route_aircraft(dist_nm: float, airlines: list[str]) -> list[str]:
 
     result = fleet_types[:2] if fleet_types else band_types[:2]
     return result
+
+
+def get_live_vatsim_flights(pilots: list, dep: str, arr: str) -> list[dict]:
     """Find pilots currently flying this exact route on VATSIM."""
     dep_iata = _icao_to_iata.get(dep, dep[:3] if len(dep) == 4 else dep)
     arr_iata = _icao_to_iata.get(arr, arr[:3] if len(arr) == 4 else arr)
@@ -305,7 +308,6 @@ def get_route_aircraft(dist_nm: float, airlines: list[str]) -> list[str]:
         fp = p.get("flight_plan") or {}
         p_dep = fp.get("departure", "").upper()
         p_arr = fp.get("arrival", "").upper()
-        # Match on ICAO or IATA for both dep and arr
         dep_match = p_dep in (dep, dep_iata)
         arr_match = p_arr in (arr, arr_iata)
         if dep_match and arr_match:
