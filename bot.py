@@ -872,26 +872,78 @@ async def prefix_pilot(ctx, callsign: str = None):
 # ATC
 # --------------------------------------------------------------------------- #
 
+def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
+    """
+    Find all controllers serving an airport using two strategies:
+    1. Callsign prefix match (KLAX_TWR, EGLL_APP etc.)
+    2. Proximity match — controller's lat/lon + visual_range covers the airport
+    This catches sector controllers like SCT_APP covering KLAX.
+    """
+    icao = icao.upper()
+    # Strip leading K/E/Y/Z etc for 3-letter fallback matching (LAX, LHR, YVR)
+    short = icao[1:] if len(icao) == 4 else icao
+
+    # Get airport coordinates for proximity check
+    ap = _airport_table.get(icao)
+    ap_lat = ap[0] if ap else None
+    ap_lon = ap[1] if ap else None
+
+    matched = {}  # callsign -> controller, deduped
+
+    for c in data.get("controllers", []):
+        cs = c.get("callsign", "").upper()
+        prefix = cs.split("_")[0]
+
+        # Strategy 1: callsign prefix matches ICAO or short code
+        if icao in cs or short in cs:
+            matched[cs] = c
+            continue
+
+        # Strategy 2: proximity — controller has lat/lon + visual_range
+        if ap_lat is None:
+            continue
+        c_lat = c.get("latitude")
+        c_lon = c.get("longitude")
+        v_range = c.get("visual_range", 0)
+        if c_lat is None or c_lon is None or not v_range:
+            continue
+        try:
+            dist = haversine_nm(float(ap_lat), float(ap_lon), float(c_lat), float(c_lon))
+            if dist <= float(v_range):
+                matched[cs] = c
+        except Exception:
+            pass
+
+    return list(matched.values())
+
+
 def _atc_embed(data: dict, station: str):
-    controllers = [c for c in data.get("controllers",[]) if station in c.get("callsign","").upper()]
+    controllers = _find_controllers_for_airport(data, station)
     if not controllers:
-        return None, f"No ATC online matching **{station}**."
-    e = discord.Embed(title=f"🎙️ ATC — {station}", colour=discord.Colour.orange(), timestamp=datetime.now(timezone.utc))
+        return None, f"No ATC online serving **{station}**."
+
+    e = discord.Embed(
+        title=f"🎙️ ATC — {station}",
+        description=f"Showing controllers with callsign match **or** whose sector covers {station}.",
+        colour=discord.Colour.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
     for c in controllers[:10]:
         atis_raw = c.get("text_atis")
-        atis = "\n".join(atis_raw) if isinstance(atis_raw,list) else (atis_raw or "")
-        logon = c.get("logon_time","")
+        atis = "\n".join(atis_raw) if isinstance(atis_raw, list) else (atis_raw or "")
+        logon = c.get("logon_time", "")
         online_str = ""
         try:
-            ld = datetime.fromisoformat(logon.replace("Z","+00:00"))
-            mins = int((datetime.now(timezone.utc)-ld).total_seconds()/60)
+            ld = datetime.fromisoformat(logon.replace("Z", "+00:00"))
+            mins = int((datetime.now(timezone.utc) - ld).total_seconds() / 60)
             online_str = f" | {mins//60}h {mins%60}m"
         except Exception:
             pass
         val = f"**{c.get('name','?')}** ({rating_name(c.get('rating',0))}) — {c.get('frequency','?')} MHz{online_str}"
         if atis:
-            val += f"\n```{atis[:400]}```"
-        e.add_field(name=c.get("callsign","?"), value=val, inline=False)
+            val += f"\n```{atis[:300]}```"
+        val = val[:1020]
+        e.add_field(name=c.get("callsign", "?"), value=val, inline=False)
     return e, None
 
 @bot.tree.command(name="atc", description="Show active ATC at a facility e.g. KSFO or EGLL_APP")
