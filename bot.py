@@ -872,7 +872,7 @@ async def prefix_pilot(ctx, callsign: str = None):
 # ATC
 # --------------------------------------------------------------------------- #
 
-def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
+async def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
     """
     Find all controllers serving an airport using two strategies:
     1. Callsign prefix match (KLAX_TWR, EGLL_APP etc.)
@@ -880,27 +880,34 @@ def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
     This catches sector controllers like SCT_APP covering KLAX.
     """
     icao = icao.upper()
-    # Strip leading K/E/Y/Z etc for 3-letter fallback matching (LAX, LHR, YVR)
     short = icao[1:] if len(icao) == 4 else icao
 
-    # Get airport coordinates for proximity check
+    # Get airport coordinates — try table first, then live METAR fetch
     ap = _airport_table.get(icao)
-    ap_lat = ap[0] if ap else None
-    ap_lon = ap[1] if ap else None
+    ap_lat = float(ap[0]) if ap else None
+    ap_lon = float(ap[1]) if ap else None
 
-    matched = {}  # callsign -> controller, deduped
+    if ap_lat is None:
+        # Try METAR as fallback for coords
+        md = await fetch_json(AWC_METAR_URL, {"ids": icao, "format": "json", "hours": 2})
+        if md and isinstance(md, list) and md:
+            ap_lat = md[0].get("lat")
+            ap_lon = md[0].get("lon")
+            if ap_lat: ap_lat = float(ap_lat)
+            if ap_lon: ap_lon = float(ap_lon)
+
+    matched = {}
 
     for c in data.get("controllers", []):
         cs = c.get("callsign", "").upper()
-        prefix = cs.split("_")[0]
 
         # Strategy 1: callsign prefix matches ICAO or short code
         if icao in cs or short in cs:
             matched[cs] = c
             continue
 
-        # Strategy 2: proximity — controller has lat/lon + visual_range
-        if ap_lat is None:
+        # Strategy 2: proximity
+        if ap_lat is None or ap_lon is None:
             continue
         c_lat = c.get("latitude")
         c_lon = c.get("longitude")
@@ -908,7 +915,7 @@ def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
         if c_lat is None or c_lon is None or not v_range:
             continue
         try:
-            dist = haversine_nm(float(ap_lat), float(ap_lon), float(c_lat), float(c_lon))
+            dist = haversine_nm(ap_lat, ap_lon, float(c_lat), float(c_lon))
             if dist <= float(v_range):
                 matched[cs] = c
         except Exception:
@@ -917,8 +924,8 @@ def _find_controllers_for_airport(data: dict, icao: str) -> list[dict]:
     return list(matched.values())
 
 
-def _atc_embed(data: dict, station: str):
-    controllers = _find_controllers_for_airport(data, station)
+async def _atc_embed(data: dict, station: str):
+    controllers = await _find_controllers_for_airport(data, station)
     if not controllers:
         return None, f"No ATC online serving **{station}**."
 
@@ -953,7 +960,7 @@ async def slash_atc(interaction: discord.Interaction, station: str):
     if not data:
         await interaction.followup.send("❌ Could not reach VATSIM data feed.")
         return
-    e, err = _atc_embed(data, station.upper().strip())
+    e, err = await _atc_embed(data, station.upper().strip())
     await (interaction.followup.send(f"❌ {err}") if err else interaction.followup.send(embed=e))
 
 @bot.command(name="atc")
@@ -965,7 +972,7 @@ async def prefix_atc(ctx, station: str = None):
     if not data:
         await ctx.send("❌ Could not reach VATSIM data feed.")
         return
-    e, err = _atc_embed(data, station.upper().strip())
+    e, err = await _atc_embed(data, station.upper().strip())
     await (ctx.send(f"❌ {err}") if err else ctx.send(embed=e))
 
 
